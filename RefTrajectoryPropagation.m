@@ -1,0 +1,273 @@
+clear; close all; clc;
+
+% Define parameters: use sun-centered EMO2000 frame as reference for the
+% state variables
+deg2rad = pi/180;
+rad2deg = 1/deg2rad;
+R0_ref = [1.067623147085261; 1.148757045773147; -0.000321627221208]*1e8;
+V0_ref = [-22.148505873534173; 18.814312217049999; -0.098774507382220];
+kSRP_ref = 1;
+lam_4_ref = -80*deg2rad;
+phi_E4_ref = 0*deg2rad;
+bias_ref = 0;
+X0 = [R0_ref; V0_ref; kSRP_ref; lam_4_ref; phi_E4_ref; bias_ref];
+
+% Create variables and initialize state transition matrix
+n = numel(X0);
+STM_0 = eye(n);
+STM_0_vec = reshape(STM_0, n^2, 1);
+
+% Set tolerance levels
+tol = 1E-10;
+options = odeset('RelTol',tol, 'AbsTol',tol);
+
+% Mice path % TO BE CHANGED BY USER!
+addpath('C:\Users\Brian\Desktop\College Stuff\USC\Year 2\Fall\ASTE 583 - Space Navigation Principles and Practice\mice\src\mice');
+addpath('C:\Users\Brian\Desktop\College Stuff\USC\Year 2\Fall\ASTE 583 - Space Navigation Principles and Practice\mice\lib');
+addpath('C:\Users\Brian\Desktop\College Stuff\USC\Year 2\Fall\ASTE 583 - Space Navigation Principles and Practice\mice\include');
+
+% Load DE440 ephemeris % PATH TO BE CHANGED BY USER!
+cspice_furnsh('C:\Users\Brian\Desktop\College Stuff\USC\Year 2\Fall\ASTE 583 - Space Navigation Principles and Practice\mice\de440s.bsp');
+
+% Load LEAPSECOND KERNEL % PATH TO BE CHANGED BY USER!
+cspice_furnsh('C:\Users\Brian\Desktop\College Stuff\USC\Year 2\Fall\ASTE 583 - Space Navigation Principles and Practice\mice\naif0012.tls.pc');
+
+date_et = '2025 DEC 01 00:00:00 UTC' ; % start date
+ET0 = cspice_str2et(date_et); % epoch time (seconds past J2000)
+
+% Initialize additional spacecraft variables
+mu_SUN = 1.3271E11;
+mu_EARTH = 3.986E5;
+pSRP = 4.54E-6*1E-3;
+A_SC = 1.5;
+m = 200;
+rho_r = 0.7;
+ep = (23 + 26/60 + 21.448/3600)*deg2rad;
+
+% Define a step size for propagation, and integrate reference trajectory
+% for the first 15 days: This is before the LTM
+step_size = 30*60;
+t_span_BEFORE_LTM = 0:step_size:15*86400;
+[t_BEFORE_LTM, X_BEFORE_LTM] = ode45(@EoM, t_span_BEFORE_LTM, [X0; STM_0_vec], options, ET0, mu_SUN, mu_EARTH, pSRP, A_SC, rho_r, m, n);
+
+% Define the time vector after the maneuver (from Day 15 to 251)
+t_span_POST_LTM = t_span_BEFORE_LTM(end):step_size:251*86400;
+
+% Initialize the planned LTM, and use the final state from the prior phase
+% (before LTM) as the initial condition with delta_V_LTM superimposed on
+% top of the spacecraft velocity at t = 15 days
+delta_V_LTM = [0.6931075; -0.8462091; 0.0956979];
+X0_LTM = X_BEFORE_LTM(end, 1:n)' + [0; 0; 0; delta_V_LTM; 0; 0; 0; 0];
+
+% Integrate the reference trajectory from t = 15 days with the maneuver to
+% t = 251 days
+[t_POST_LTM, X_POST_LTM] = ode45(@EoM, t_span_POST_LTM, [X0_LTM; STM_0_vec], options, ET0, mu_SUN, mu_EARTH, pSRP, A_SC, rho_r, m, n);
+
+% Let's create and store all values of the reference trajectory within
+% t_ALL_WITH_LTM and X_ALL_WITH_LTM
+t_ALL_WITH_LTM = [t_span_BEFORE_LTM'; t_span_POST_LTM'];
+X_ALL_WITH_LTM(:, 1:6) = [X_BEFORE_LTM(:, 1:6); X_POST_LTM(:, 1:6)];
+
+% Create the Earth and Moon ephemeris and observe their motions over the
+% 251-day period
+for i = 1:length(t_ALL_WITH_LTM)
+    xEarth_ephemeris(i, 1:6) = cspice_spkezr('Earth',ET0+t_ALL_WITH_LTM(i), 'ECLIPJ2000', 'NONE','Sun');
+    xMoon_ephemeris(i, 1:6) = cspice_spkezr('MOON',ET0+t_ALL_WITH_LTM(i), 'J2000', 'NONE','EARTH');
+end
+
+% To see the reference trajectory with respect to Earth, we can use vector
+% math to get the trajectory with respect to Earth's ephemeris
+X_ALL_WRT_EARTH_EMO = X_ALL_WITH_LTM - xEarth_ephemeris;
+
+% We're in the Earth-Centered EMO frame, but we'll transform over to the
+% EME2000 frame (not necessary for observing trajectory with respect to the
+% moon)
+Rot_EME2000_to_EMO2000 = [1, 0, 0; 0, cos(ep), sin(ep); 0, -sin(ep), cos(ep)];
+Rot_EMO2000_to_EME2000 = transpose(Rot_EME2000_to_EMO2000);
+for i = 1:length(t_ALL_WITH_LTM)
+    X_ALL_WRT_EARTH_EME(i, :) = [Rot_EMO2000_to_EME2000, zeros(3, 3); zeros(3, 3), Rot_EMO2000_to_EME2000]*X_ALL_WRT_EARTH_EMO(i, :)';
+end
+
+% Use either the EME2000 or EMO2000 frame to observe the reference
+% trajectory with respect to the moon's ephemeris, and keep track of the
+% radial distance from the center of the moon to determine the spacecraft's
+% lowest altitude
+X_ALL_WRT_MOON = X_ALL_WRT_EARTH_EME - xMoon_ephemeris;
+for i = 1:length(t_ALL_WITH_LTM)
+    r_WRT_MOON(i) = norm(X_ALL_WRT_MOON(i, 1:3));
+end
+
+% Let's initialize the ground station coordinates
+station_1 = [35.244352, -116.889538];
+station_2 = [-35.220919, 148.981267];
+station_3 = [40.241355, -4.2480085];
+station_4 = [-80, 0];
+
+% Ground tracking: define initial sidereal time and consider Earth's
+% rotation
+phi_G0 = (10/60+43/3600)*deg2rad;
+w_e = 7.292116E-5;
+
+% Obtain the spacecraft's coordinates with respect to Earth by propagating
+% the sidereal time forward and transforming the spacecraft state from the
+% EME2000 frame to the ECEF frame
+for i = 1:length(t_ALL_WITH_LTM)
+    phi_G(i) = phi_G0 + w_e*(t_ALL_WITH_LTM(i) - t_ALL_WITH_LTM(1));
+    Rot_ECI_ECEF = [cos(phi_G(i)), sin(phi_G(i)), 0; -sin(phi_G(i)), cos(phi_G(i)), 0; 0, 0, 1];
+    R_ECEF(i, 1:3) = Rot_ECI_ECEF*[X_ALL_WRT_EARTH_EME(i, 1); X_ALL_WRT_EARTH_EME(i, 2); X_ALL_WRT_EARTH_EME(i, 3)];
+    lam(i) = asind(R_ECEF(i, 3)/norm(R_ECEF(i, 1:3)));
+    phi_E(i) = atan2d(R_ECEF(i, 2), R_ECEF(i, 1));
+end
+
+% Determine the number of times the logitude goes from 180 deg to -180
+% degrees so we can split the longitude array when plotting so we don't get
+% any lines that go from 180 deg to -180 deg
+number_of_crossovers = 0;
+crossover_iteration_beg = 1;
+crossover_iteration_end = [];
+for i = 2:length(phi_E)
+    if((phi_E(i-1) > 179.9 && phi_E(i) < -179.9) || (phi_E(i-1) < -179.9 && phi_E(i) > 179.9))
+        number_of_crossovers = number_of_crossovers + 1;
+        crossover_iteration_end(number_of_crossovers) = i - 1;
+        crossover_iteration_beg(number_of_crossovers + 1) = i;
+    end
+end
+
+crossover_iteration_end(number_of_crossovers + 1) = length(phi_E);
+for i = 1:number_of_crossovers+1
+    string_for_longitude_array_portions = ["longitude_array_portion_" + i + " = " +...
+        "phi_E(crossover_iteration_beg(i):crossover_iteration_end(i))" + ";"];
+    eval(string_for_longitude_array_portions);
+end
+
+% Let's also show where the trajectory starts as well as when the LTM
+% occurs on the ground track
+lam_start = lam(1);
+long_start = phi_E(1);
+lam_LTM = lam(length(t_BEFORE_LTM)+1);
+long_LTM = phi_E(length(t_BEFORE_LTM)+1);
+
+% Show the ground tracking plot of the reference trajectory with respect to
+% the Earth
+figure(1);
+for i = 1:number_of_crossovers+1
+    string_for_longitude_array_plotting = ["longitude_array_portion_" + i];
+    geoplot(lam(crossover_iteration_beg(i):crossover_iteration_end(i)), eval(string_for_longitude_array_plotting), 'ob', LineWidth=2);
+    hold on;
+end
+title("Earth Ground Track: WITH LTM");
+grid on;
+hold on;
+geoplot(station_1(1), station_1(2), "rs", ...
+    MarkerSize=8, ...
+    MarkerFaceColor="r", ...
+    MarkerEdgeColor="k")
+geoplot(station_2(1), station_2(2), "rs", ...
+    MarkerSize=8, ...
+    MarkerFaceColor="g", ...
+    MarkerEdgeColor="k")
+geoplot(station_3(1), station_3(2), "rs", ...
+    MarkerSize=8, ...
+    MarkerFaceColor="m", ...
+    MarkerEdgeColor="k")
+geoplot(station_4(1), station_4(2), "rs", ...
+    MarkerSize=8, ...
+    MarkerFaceColor="k", ...
+    MarkerEdgeColor="k")
+geoplot(lam_start, long_start, "rd", ...
+    MarkerSize=8, ...
+    MarkerFaceColor="y", ...
+    MarkerEdgeColor="k")
+geoplot(lam_LTM, long_LTM, "rd", ...
+    MarkerSize=8, ...
+    MarkerFaceColor="c", ...
+    MarkerEdgeColor="k")
+legend("Ground Track", "Station 1", "Station 2", "Station 3", "Station 4", "Trajectory Start", "LTM Point");
+legend("Location", "northeastoutside");
+legend('Orientation','vertical');
+
+% Plotting reference trajectory of the spacecraft with respect to the moon,
+% and determine flyby altitude
+figure(2);
+plot3(X_ALL_WRT_MOON(:, 1), X_ALL_WRT_MOON(:, 2), X_ALL_WRT_MOON(:, 3));
+title("Reference Trajectory with LTM: WRT Moon")
+xlabel("x (km)")
+ylabel("y (km)")
+zlabel("z (km)")
+grid on;
+hold on;
+plot3(X_ALL_WRT_MOON(length(t_BEFORE_LTM), 1), X_ALL_WRT_MOON(length(t_BEFORE_LTM), 2), X_ALL_WRT_MOON(length(t_BEFORE_LTM), 3), "rd", ...
+    MarkerSize=8, ...
+    MarkerFaceColor="r", ...
+    MarkerEdgeColor="k")
+plot3(0, 0, 0, "go", ...
+    MarkerSize=8, ...
+    MarkerFaceColor="k", ...
+    MarkerEdgeColor="k")
+legend("Trajectory", "LTM", "Moon")
+
+% Compute flyby altitude
+flyby_altitude = min(r_WRT_MOON) - 1737;
+
+% Observe the reference trajectory with respect to Earth
+figure(3);
+plot3(X_ALL_WRT_EARTH_EME(:, 1), X_ALL_WRT_EARTH_EME(:, 2), X_ALL_WRT_EARTH_EME(:, 3));
+title("Reference Trajectory with LTM: WRT Earth")
+xlabel("x (km)")
+ylabel("y (km)")
+zlabel("z (km)")
+grid on;
+hold on;
+plot3(X_ALL_WRT_EARTH_EME(length(t_BEFORE_LTM), 1), X_ALL_WRT_EARTH_EME(length(t_BEFORE_LTM), 2), X_ALL_WRT_EARTH_EME(length(t_BEFORE_LTM), 3), "rd", ...
+    MarkerSize=8, ...
+    MarkerFaceColor="r", ...
+    MarkerEdgeColor="k")
+plot3(0, 0, 0, "bo", ...
+    MarkerSize=8, ...
+    MarkerFaceColor="k", ...
+    MarkerEdgeColor="k")
+legend("Trajectory", "LTM", "Earth")
+
+% Equations of motion that consider the gravity of Earth and sun, as well
+% as solar radiation pressure
+function dXdt = EoM(t, X, ET0, mu_SUN, mu_EARTH, pSRP, A_SC, rho_r, m, n)
+    % Earth emphemeris
+    xEarth_ephemeris = cspice_spkezr('Earth',ET0+t, 'ECLIPJ2000', 'NONE','Sun');
+    r_13_vec = xEarth_ephemeris(1:3);
+    r_31_vec = -r_13_vec;
+    r_31_norm = norm(r_31_vec);
+
+    r_12_vec = X(1:3);
+    r_12_norm = norm(r_12_vec);
+
+    r_32_vec =  r_12_vec - r_13_vec;
+    r_32_norm = norm(r_32_vec);
+    kSRP = X(7);
+
+    dXdt(1:3) = X(4:6);
+    dXdt(4:6) = -mu_SUN*r_12_vec/r_12_norm^3 - mu_EARTH*(r_32_vec/r_32_norm^3 - r_31_vec/r_31_norm^3) + kSRP*pSRP*A_SC*(1+rho_r)/m*r_12_vec/r_12_norm;
+    dXdt(7) = 0;
+    dXdt(8) = 0;
+    dXdt(9) = 0;
+    dXdt(10) = 0;
+
+    x12 = r_12_vec(1);
+    y12 = r_12_vec(2);
+    z12 = r_12_vec(3);
+    x31 = r_31_vec(1);
+    y31 = r_31_vec(2);
+    z31 = r_31_vec(3);
+
+    A_jacobian = [0, 0, 0, 1, 0, 0, 0, 0, 0, 0;...
+            0, 0, 0, 0, 1, 0, 0, 0, 0, 0;...
+            0, 0, 0, 0, 0, 1, 0, 0, 0, 0;...
+            (3*mu_SUN*x12^2)/(x12^2 + y12^2 + z12^2)^(5/2) - mu_EARTH*(1/((x12 + x31)^2 + (y12 + y31)^2 + (z12 + z31)^2)^(3/2) - (3*(2*x12 + 2*x31)*(x12 + x31))/(2*((x12 + x31)^2 + (y12 + y31)^2 + (z12 + z31)^2)^(5/2))) - mu_SUN/(x12^2 + y12^2 + z12^2)^(3/2) - (A_SC*kSRP*pSRP*(rho_r + 1))/(m*(x12^2 + y12^2 + z12^2)^(1/2)) + (A_SC*kSRP*pSRP*x12^2*(rho_r + 1))/(m*(x12^2 + y12^2 + z12^2)^(3/2)), (3*mu_SUN*x12*y12)/(x12^2 + y12^2 + z12^2)^(5/2) + (3*mu_EARTH*(2*y12 + 2*y31)*(x12 + x31))/(2*((x12 + x31)^2 + (y12 + y31)^2 + (z12 + z31)^2)^(5/2)) + (A_SC*kSRP*pSRP*x12*y12*(rho_r + 1))/(m*(x12^2 + y12^2 + z12^2)^(3/2)), (3*mu_EARTH*(2*z12 + 2*z31)*(x12 + x31))/(2*((x12 + x31)^2 + (y12 + y31)^2 + (z12 + z31)^2)^(5/2)) + (3*mu_SUN*x12*z12)/(x12^2 + y12^2 + z12^2)^(5/2) + (A_SC*kSRP*pSRP*x12*z12*(rho_r + 1))/(m*(x12^2 + y12^2 + z12^2)^(3/2)), 0, 0, 0, -(A_SC*pSRP*x12*(rho_r + 1))/(m*(x12^2 + y12^2 + z12^2)^(1/2)), 0, 0, 0;...
+            (3*mu_SUN*x12*y12)/(x12^2 + y12^2 + z12^2)^(5/2) + (3*mu_EARTH*(2*x12 + 2*x31)*(y12 + y31))/(2*((x12 + x31)^2 + (y12 + y31)^2 + (z12 + z31)^2)^(5/2)) + (A_SC*kSRP*pSRP*x12*y12*(rho_r + 1))/(m*(x12^2 + y12^2 + z12^2)^(3/2)), (3*mu_SUN*y12^2)/(x12^2 + y12^2 + z12^2)^(5/2) - mu_EARTH*(1/((x12 + x31)^2 + (y12 + y31)^2 + (z12 + z31)^2)^(3/2) - (3*(2*y12 + 2*y31)*(y12 + y31))/(2*((x12 + x31)^2 + (y12 + y31)^2 + (z12 + z31)^2)^(5/2))) - mu_SUN/(x12^2 + y12^2 + z12^2)^(3/2) - (A_SC*kSRP*pSRP*(rho_r + 1))/(m*(x12^2 + y12^2 + z12^2)^(1/2)) + (A_SC*kSRP*pSRP*y12^2*(rho_r + 1))/(m*(x12^2 + y12^2 + z12^2)^(3/2)), (3*mu_EARTH*(2*z12 + 2*z31)*(y12 + y31))/(2*((x12 + x31)^2 + (y12 + y31)^2 + (z12 + z31)^2)^(5/2)) + (3*mu_SUN*y12*z12)/(x12^2 + y12^2 + z12^2)^(5/2) + (A_SC*kSRP*pSRP*y12*z12*(rho_r + 1))/(m*(x12^2 + y12^2 + z12^2)^(3/2)), 0, 0, 0, -(A_SC*pSRP*y12*(rho_r + 1))/(m*(x12^2 + y12^2 + z12^2)^(1/2)), 0, 0, 0;...
+            (3*mu_EARTH*(2*x12 + 2*x31)*(z12 + z31))/(2*((x12 + x31)^2 + (y12 + y31)^2 + (z12 + z31)^2)^(5/2)) + (3*mu_SUN*x12*z12)/(x12^2 + y12^2 + z12^2)^(5/2) + (A_SC*kSRP*pSRP*x12*z12*(rho_r + 1))/(m*(x12^2 + y12^2 + z12^2)^(3/2)), (3*mu_EARTH*(2*y12 + 2*y31)*(z12 + z31))/(2*((x12 + x31)^2 + (y12 + y31)^2 + (z12 + z31)^2)^(5/2)) + (3*mu_SUN*y12*z12)/(x12^2 + y12^2 + z12^2)^(5/2) + (A_SC*kSRP*pSRP*y12*z12*(rho_r + 1))/(m*(x12^2 + y12^2 + z12^2)^(3/2)), (3*mu_SUN*z12^2)/(x12^2 + y12^2 + z12^2)^(5/2) - mu_EARTH*(1/((x12 + x31)^2 + (y12 + y31)^2 + (z12 + z31)^2)^(3/2) - (3*(2*z12 + 2*z31)*(z12 + z31))/(2*((x12 + x31)^2 + (y12 + y31)^2 + (z12 + z31)^2)^(5/2))) - mu_SUN/(x12^2 + y12^2 + z12^2)^(3/2) - (A_SC*kSRP*pSRP*(rho_r + 1))/(m*(x12^2 + y12^2 + z12^2)^(1/2)) + (A_SC*kSRP*pSRP*z12^2*(rho_r + 1))/(m*(x12^2 + y12^2 + z12^2)^(3/2)), 0, 0, 0, -(A_SC*pSRP*z12*(rho_r + 1))/(m*(x12^2 + y12^2 + z12^2)^(1/2)), 0, 0, 0;...
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0;...
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0;...
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0;...
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    dXdt(n+1:n+n^2) = A_jacobian*reshape(X(n+1:n+n^2), n, n);
+    dXdt = dXdt';
+end
